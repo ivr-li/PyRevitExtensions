@@ -19,12 +19,17 @@ clr.AddReference("WindowsBase")
 clr.AddReference("RevitAPI")
 clr.AddReference("RevitAPIUI")
 
+import System.Windows as WinNS
 from operator import attrgetter
 
 from Autodesk.Revit.DB import *
 from Autodesk.Revit.Exceptions import InvalidOperationException
 from Autodesk.Revit.UI import *
 from dckpanels.filter_rules_editor import show_editor
+from dckpanels.graphics_override_editor import (
+    get_indicator_colors,
+    has_non_default_override,
+)
 
 # #==================================================
 # #Update pyrevot.forms.SelectFromList if pyrevit vers < 4.13?
@@ -239,6 +244,13 @@ class FilterItem(INotifyPropertyChanged):
         self._is_filter_enabled = view.GetIsFilterEnabled(filter_element.Id)
         self._filter_visibility = view.GetFilterVisibility(filter_element.Id)
 
+        # Graphics override indicator
+        self._has_graphics_override = self._detect_override(view, filter_element.Id)
+        fill, border, tip = self._get_indicator(view, filter_element.Id)
+        self._indicator_fill = fill
+        self._indicator_border = border
+        self._indicator_tooltip = tip
+
         # XAML bindings
         self._is_category = False
         self._is_filter = True
@@ -275,6 +287,42 @@ class FilterItem(INotifyPropertyChanged):
         if self._filter_visibility != value:
             self._filter_visibility = value
             self._raise("FilterVisibility")
+
+    # --- Graphics override indicator ---
+    @property
+    def HasGraphicsOverride(self):
+        return self._has_graphics_override
+
+    @property
+    def OverrideIndicatorColor(self):
+        return self._indicator_fill
+
+    @property
+    def OverrideIndicatorBorder(self):
+        return self._indicator_border
+
+    @property
+    def OverrideIndicatorTooltip(self):
+        return self._indicator_tooltip
+
+    @property
+    def OverrideIndicatorBorderThickness(self):
+        t = 2 if self._indicator_border else 0
+        return WinNS.Thickness(t)
+
+    def _detect_override(self, view, filter_id):
+        """Check if filter has non-default graphic overrides."""
+        try:
+            return has_non_default_override(view, filter_id)
+        except Exception:
+            return False
+
+    def _get_indicator(self, view, filter_id):
+        """Get (fill_brush, border_brush, tooltip) for indicator."""
+        try:
+            return get_indicator_colors(view, filter_id)
+        except Exception:
+            return (None, None, "")
 
     # ------- XAML type flags -------
     @property
@@ -406,7 +454,12 @@ class EditFilterRulesHandler(IExternalEventHandler):
         if not element:
             return
         try:
-            saved = show_editor(self.panel.doc, element)
+            target_view = self.panel._determine_target_view()
+            # Only pass view if filter is applied to it
+            view_for_graphics = None
+            if element.Id in target_view.GetFilters():
+                view_for_graphics = target_view
+            saved = show_editor(self.panel.doc, element, view=view_for_graphics)
             if saved:
                 self.panel._setup_panel()
         except:
@@ -424,27 +477,26 @@ class CreateAndEditFilterHandler(IExternalEventHandler):
 
     def Execute(self, app):
         try:
-            if self.panel._is_template_using():
-                uidoc = app.ActiveUIDocument
-                if not uidoc:
-                    return
+            uidoc = app.ActiveUIDocument
+            if not uidoc:
+                return
 
-                doc = uidoc.Document
+            doc = uidoc.Document
+            target_view = self.panel._determine_target_view()
+            filter_name = "Новый фильтр_{}".format(int(time.time() * 1000))
 
-                filter_name = "Новый фильтр_{}".format(int(time.time() * 1000))
+            cats = List[ElementId]()
+            with Transaction(doc, "Panel_Создать фильтр") as t:
+                t.Start()
+                f = ParameterFilterElement.Create(doc, filter_name, cats)
+                f_id = f.Id
+                # Add to view so graphics tab is available
+                target_view.AddFilter(f_id)
+                t.Commit()
 
-                cats = List[ElementId]()
-                with Transaction(doc, "Panel_Создать фильтр") as t:
-                    t.Start()
-                    f = ParameterFilterElement.Create(doc, filter_name, cats)
-                    f_id = f.Id
-                    t.Commit()
-
-                new_filter = doc.GetElement(f_id)
-
-                # show_editor expects ParameterFilterElement directly
-                self.panel.edit_rules_handler.filter_element = new_filter
-                self.panel.edit_rules_event.Raise()
+            new_filter = doc.GetElement(f_id)
+            self.panel.edit_rules_handler.filter_element = new_filter
+            self.panel.edit_rules_event.Raise()
 
         except Exception as ex:
             print(traceback.format_exc())
