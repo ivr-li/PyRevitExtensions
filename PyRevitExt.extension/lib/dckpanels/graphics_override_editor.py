@@ -201,11 +201,17 @@ def get_indicator_colors(view, filter_id):
 def _get_first_override_color(ovr, is_projection):
     """Extract first non-default color from projection or cut overrides."""
     if is_projection:
-        attrs = ["ProjectionLineColor", "SurfaceForegroundPatternColor",
-                 "SurfaceBackgroundPatternColor"]
+        attrs = [
+            "ProjectionLineColor",
+            "SurfaceForegroundPatternColor",
+            "SurfaceBackgroundPatternColor",
+        ]
     else:
-        attrs = ["CutLineColor", "CutForegroundPatternColor",
-                 "CutBackgroundPatternColor"]
+        attrs = [
+            "CutLineColor",
+            "CutForegroundPatternColor",
+            "CutBackgroundPatternColor",
+        ]
     for attr in attrs:
         rgb = _revit_to_rgb(getattr(ovr, attr))
         if not _is_no_override_color(rgb):

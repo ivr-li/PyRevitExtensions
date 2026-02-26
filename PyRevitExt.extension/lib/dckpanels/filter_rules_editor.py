@@ -13,19 +13,9 @@ clr.AddReference("System.Xml")
 clr.AddReference("RevitAPI")
 import System.Windows as WinNS
 import System.Windows.Controls as Controls
+import System.Windows.Media as WinMedia
 import System.Xml
 from Autodesk.Revit.DB import *
-from pyrevit import forms
-from pyrevit.forms import WPFWindow
-from System import EventHandler
-from System.Collections.Generic import List
-from System.Collections.ObjectModel import ObservableCollection
-from System.ComponentModel import INotifyPropertyChanged, PropertyChangedEventArgs
-from System.IO import StringReader
-from System.Windows.Data import CollectionViewSource
-from System.Windows.Markup import XamlReader
-from System.Xml import XmlReader
-
 from dckpanels.graphics_override_editor import (
     GRAPHICS_TAB_XAML,
     GraphicsOverrideModel,
@@ -34,6 +24,15 @@ from dckpanels.graphics_override_editor import (
     read_graphics_from_ui,
     setup_graphics_tab,
 )
+from pyrevit import forms
+from pyrevit.forms import WPFWindow
+from System import EventHandler
+from System.Collections.Generic import List
+from System.Collections.ObjectModel import ObservableCollection
+from System.ComponentModel import INotifyPropertyChanged, PropertyChangedEventArgs
+from System.IO import StringReader
+from System.Windows.Markup import XamlReader
+from System.Xml import XmlReader
 
 # =================== Operator definitions ===================
 STRING_OPERATORS = [
@@ -598,6 +597,90 @@ def _collect_eid_choices(doc, param_id, category_ids):
     choices = _collect_elements_of_class(doc, elem_class)
     _eid_choices_cache[cache_key] = choices
     return choices
+
+
+# =================== Parameter value collection ===================
+_param_values_cache = {}
+_MAX_ELEMENTS_SCAN = 500
+
+
+def _collect_param_values(doc, param_id, category_ids, storage_type):
+    """Collect unique parameter values from elements (cached)."""
+    cache_key = (
+        param_id.IntegerValue,
+        tuple(c.IntegerValue for c in category_ids),
+        storage_type,
+    )
+    if cache_key in _param_values_cache:
+        return _param_values_cache[cache_key]
+    values = set()
+    pid_int = param_id.IntegerValue
+    bip = BuiltInParameter(pid_int) if pid_int < 0 else None
+    for cid in category_ids or []:
+        _scan_category_values(doc, cid, pid_int, bip, storage_type, values)
+    result = sorted(v for v in values if v)
+    _param_values_cache[cache_key] = result
+    return result
+
+
+def _scan_category_values(doc, cid, pid_int, bip, storage_type, values):
+    """Scan elements of one category to collect parameter values."""
+    count = 0
+    for getter in (
+        lambda: (
+            FilteredElementCollector(doc)
+            .OfCategoryId(cid)
+            .WhereElementIsNotElementType()
+        ),
+        lambda: (
+            FilteredElementCollector(doc).OfCategoryId(cid).WhereElementIsElementType()
+        ),
+    ):
+        for elem in getter():
+            count += 1
+            if count > _MAX_ELEMENTS_SCAN:
+                return
+            _extract_param_value(elem, pid_int, bip, storage_type, values)
+
+
+def _extract_param_value(elem, pid_int, bip, storage_type, values):
+    """Extract parameter value from element via BIP or Parameters scan."""
+    param = _find_param_on_element(elem, pid_int, bip)
+    if not param or not param.HasValue:
+        return
+    val = _read_param_display_value(param, storage_type)
+    if val:
+        values.add(val)
+
+
+def _find_param_on_element(elem, pid_int, bip):
+    """Find parameter on element — try get_Parameter(BIP) first, then scan."""
+    if bip is not None:
+        try:
+            p = elem.get_Parameter(bip)
+            if p:
+                return p
+        except Exception:
+            pass
+    for p in elem.Parameters:
+        if p.Id.IntegerValue == pid_int:
+            return p
+    return None
+
+
+def _read_param_display_value(param, storage_type):
+    """Read parameter value as display string."""
+    if storage_type == "string":
+        return param.AsString() or ""
+    if storage_type == "number":
+        vs = param.AsValueString()
+        if vs:
+            return vs
+        try:
+            return str(param.AsDouble())
+        except Exception:
+            return str(param.AsInteger())
+    return ""
 
 
 # =================== Parameter storage info ===================
@@ -1200,16 +1283,26 @@ Width="24" Height="24"/>
 
 
 # =================== Editor window ===================
-def show_editor(doc, filter_element, view=None):
-    """Show the filter rules editor window. Pass view to enable graphics tab."""
+def show_editor(doc, filter_element=None, view=None):
+    """Show the filter rules editor window.
+    filter_element=None opens in creation mode (filter created on save).
+    Pass view to enable graphics tab.
+    """
     _bip_cache.clear()
     _unit_cache.clear()
     _yesno_pids.clear()
     _eid_choices_cache.clear()
+    _param_values_cache.clear()
     clear_pattern_caches()
-    parsed = parse_element_filter(doc, filter_element)
-    current_cat_ids = list(filter_element.GetCategories())
-    current_cat_set = set(c.IntegerValue for c in current_cat_ids)
+    is_new = filter_element is None
+    if is_new:
+        current_cat_ids = []
+        current_cat_set = set()
+        parsed = ("and", [])
+    else:
+        parsed = parse_element_filter(doc, filter_element)
+        current_cat_ids = list(filter_element.GetCategories())
+        current_cat_set = set(c.IntegerValue for c in current_cat_ids)
     all_cat_ids = ParameterFilterUtilities.GetAllFilterableCategories()
     all_categories = []
     for cid in all_cat_ids:
@@ -1228,7 +1321,7 @@ def show_editor(doc, filter_element, view=None):
     rule_items = []
     if parsed is None:
         is_read_only = True
-    else:
+    elif not is_new:
         logic, rules_data = parsed
         for rd in rules_data:
             param_info = _find_param(
@@ -1250,11 +1343,11 @@ def show_editor(doc, filter_element, view=None):
                     break
             rule_items.append(ri)
     window = WPFWindow(EDITOR_XAML, literal_string=True)
-    window.FilterNameBox.Text = filter_element.Name
+    window.FilterNameBox.Text = "Новый фильтр" if is_new else filter_element.Name
 
-    # Graphics tab setup
+    # Graphics tab setup (disabled for new filters — no Id yet)
     graphics_model = [None]
-    if view:
+    if view and not is_new:
         graphics_model[0] = GraphicsOverrideModel(view, filter_element.Id, doc)
         graphics_content = _init_graphics_tab(window, graphics_model[0], doc)
     else:
@@ -1328,8 +1421,14 @@ def show_editor(doc, filter_element, view=None):
     if graphics_content and graphics_model[0]:
         read_graphics_from_ui(graphics_content, graphics_model[0])
     return _save_filter(
-        doc, filter_element, window, all_categories, rule_rows,
-        cat_params_cache, view=view, graphics_model=graphics_model[0],
+        doc,
+        filter_element,
+        window,
+        all_categories,
+        rule_rows,
+        cat_params_cache,
+        view=view,
+        graphics_model=graphics_model[0],
     )
 
 
@@ -1536,6 +1635,18 @@ def _show_textbox(value_combo, value_box):
     value_box.Visibility = WinNS.Visibility.Visible
 
 
+def _show_editable_combo(value_combo, value_box, choices, current_value):
+    """Show editable ComboBox with choices and free text input."""
+    value_box.Visibility = WinNS.Visibility.Collapsed
+    value_combo.Visibility = WinNS.Visibility.Visible
+    value_combo.IsEditable = True
+    value_combo.IsTextSearchEnabled = True
+    value_combo.Items.Clear()
+    for choice in choices:
+        value_combo.Items.Add(choice)
+    value_combo.Text = current_value or ""
+
+
 def _setup_value_control(doc, rule_item, value_box, value_combo, category_ids):
     """Decide whether to show ComboBox or TextBox based on param type."""
     param = rule_item.SelectedParameter
@@ -1555,7 +1666,33 @@ def _setup_value_control(doc, rule_item, value_box, value_combo, category_ids):
             current = rule_item.Value or ""
             _show_combo_choices(value_combo, value_box, names, current)
             return
+    # Editable combo for string/number params with available values
+    if param.storage_type in ("string", "number"):
+        values = _collect_param_values(doc, pid, category_ids or [], param.storage_type)
+        if values:
+            current = rule_item.Value or ""
+            _show_editable_combo(value_combo, value_box, values, current)
+            return
     _show_textbox(value_combo, value_box)
+
+
+def _find_child_of_type(parent, child_type):
+    """Recursively find first child of given type in visual tree."""
+    for i in range(WinMedia.VisualTreeHelper.GetChildrenCount(parent)):
+        child = WinMedia.VisualTreeHelper.GetChild(parent, i)
+        if isinstance(child, child_type):
+            return child
+        result = _find_child_of_type(child, child_type)
+        if result:
+            return result
+    return None
+
+
+def _scroll_combo_to_index(combo, index):
+    """Scroll combo dropdown so that item at index is at the top."""
+    sv = _find_child_of_type(combo, Controls.ScrollViewer)
+    if sv:
+        sv.ScrollToVerticalOffset(index)
 
 
 def _add_rule_row(window, rule_rows, rule_item, available_params, doc=None, cache=None):
@@ -1575,80 +1712,48 @@ def _add_rule_row(window, rule_rows, rule_item, available_params, doc=None, cach
     param_combo.ItemsSource = all_params
     param_combo.DisplayMemberPath = "name"
     param_combo.IsTextSearchEnabled = False
-    view = CollectionViewSource.GetDefaultView(param_combo.ItemsSource)
-    search_state = {
-        "active": False,
-        "query": "",
-        "suppress": False,
-        "last_restored": "",
-    }
+    _suppress = [False]
 
-    def filter_func(item):
-        q = search_state["query"]
-        if not q:
-            return True
-        return q in item.name.lower()
-
-    view.Filter = lambda item: filter_func(item)
-
-    def _on_search_text_changed(sender, args):
-        if search_state["suppress"]:
+    def _on_param_text_changed(sender, args):
+        """Highlight first matching item in dropdown via SelectedIndex."""
+        if _suppress[0]:
             return
-        tb = sender
-        typed = tb.Text or ""
-        if typed == search_state.get("last_restored", ""):
+        original = sender.Text or ""
+        query = original.lower()
+        if not query.strip():
             return
-        caret = tb.SelectionStart
-        search_state["query"] = typed.lower().strip()
-        search_state["active"] = bool(search_state["query"])
-        search_state["suppress"] = True
-        try:
-            param_combo.SelectedItem = None
-            view.Refresh()
-            # Restore text and caret — WPF overwrites them on SelectedItem/Refresh
-            search_state["last_restored"] = typed
-            tb.Text = typed
-            tb.SelectionStart = caret
-            tb.SelectionLength = 0
-        finally:
-            search_state["suppress"] = False
         if not param_combo.IsDropDownOpen:
             param_combo.IsDropDownOpen = True
-
-    def _on_selection_changed_for_search(s, e):
-        """Clear search filter when user picks an item from dropdown."""
-        if search_state["suppress"]:
-            return
-        if not search_state["active"]:
-            return
-        search_state["query"] = ""
-        search_state["active"] = False
-        search_state["last_restored"] = ""
-        search_state["suppress"] = True
-        try:
-            view.Refresh()
-        finally:
-            search_state["suppress"] = False
-
-    param_combo.SelectionChanged += _on_selection_changed_for_search
+        tb = sender
+        stripped = query.strip()
+        for i, item in enumerate(all_params):
+            if stripped in item.name.lower():
+                _suppress[0] = True
+                param_combo.SelectedIndex = i
+                # Restore original text and caret at end (WPF overwrites on SelectedIndex)
+                tb.Text = original
+                tb.SelectionStart = len(original)
+                tb.SelectionLength = 0
+                _suppress[0] = False
+                return
 
     if rule_item.SelectedParameter:
-        search_state["suppress"] = True
+        _suppress[0] = True
         param_combo.SelectedItem = rule_item.SelectedParameter
-        search_state["suppress"] = False
+        _suppress[0] = False
 
-    # Hook editable textbox — try immediately, fallback to Loaded
+    # Hook editable textbox for search-by-typing
     param_combo.ApplyTemplate()
     _edit_tb = param_combo.Template.FindName("PART_EditableTextBox", param_combo)
     if _edit_tb:
-        _edit_tb.TextChanged += _on_search_text_changed
+        _edit_tb.TextChanged += _on_param_text_changed
     else:
 
         def _hook_search(s, e):
             param_combo.ApplyTemplate()
             tb = param_combo.Template.FindName("PART_EditableTextBox", param_combo)
             if tb:
-                tb.TextChanged += _on_search_text_changed
+                tb.TextChanged += _on_param_text_changed
 
         param_combo.Loaded += _hook_search
     operators = list(rule_item.AvailableOperators)
@@ -1675,7 +1780,7 @@ def _add_rule_row(window, rule_rows, rule_item, available_params, doc=None, cach
         _setup_value_control(doc, rule_item, value_box, value_combo, cat_ids)
 
     def on_param_changed(s, e):
-        if search_state["suppress"]:
+        if _suppress[0]:
             return
         sel = param_combo.SelectedItem
         if not sel:
@@ -1711,9 +1816,12 @@ def _add_rule_row(window, rule_rows, rule_item, available_params, doc=None, cach
         rule_item.Value = value_box.Text
 
     def on_combo_changed(s, e):
-        sel = value_combo.SelectedItem
-        if sel is not None:
-            rule_item.Value = str(sel)
+        if value_combo.IsEditable:
+            rule_item.Value = value_combo.Text or ""
+        else:
+            sel = value_combo.SelectedItem
+            if sel is not None:
+                rule_item.Value = str(sel)
 
     param_combo.SelectionChanged += on_param_changed
     operator_combo.SelectionChanged += on_operator_changed
@@ -1764,48 +1872,70 @@ def _pre_save_validate(doc, window, rule_rows, cache):
     return _validate_rules_vs_categories(doc, cat_ids, rule_items, cache)
 
 
-def _save_filter(
-    doc, filter_element, window, all_categories, rule_rows,
-    cache=None, view=None, graphics_model=None,
-):
-    """Save changes to the filter element and optional graphics overrides."""
-    try:
-        new_cat_ids = []
-        for child in _iter_category_checkboxes(window):
-            if child.IsChecked:
-                new_cat_ids.append(child.Tag.CategoryId)
-        if not new_cat_ids:
-            return False
-        rule_items = []
-        for ri, grid in rule_rows:
-            value_box = grid.FindName("ValueBox")
-            value_combo = grid.FindName("ValueCombo")
-            param_combo = grid.FindName("ParamCombo")
-            operator_combo = grid.FindName("OperatorCombo")
-            # Read value from visible control
-            if value_combo and value_combo.Visibility == WinNS.Visibility.Visible:
+def _read_rule_items_from_ui(rule_rows):
+    """Read rule items state from UI controls."""
+    rule_items = []
+    for ri, grid in rule_rows:
+        value_box = grid.FindName("ValueBox")
+        value_combo = grid.FindName("ValueCombo")
+        param_combo = grid.FindName("ParamCombo")
+        operator_combo = grid.FindName("OperatorCombo")
+        # Read value from visible control
+        if value_combo and value_combo.Visibility == WinNS.Visibility.Visible:
+            if value_combo.IsEditable:
+                ri.Value = value_combo.Text or ""
+            else:
                 sel = value_combo.SelectedItem
                 if sel is not None:
                     ri.Value = str(sel)
-            elif value_box:
-                ri.Value = value_box.Text
-            if param_combo and param_combo.SelectedItem:
-                ri._selected_parameter = param_combo.SelectedItem
-            if operator_combo and operator_combo.SelectedItem:
-                ri._selected_operator = operator_combo.SelectedItem
-            rule_items.append(ri)
+        elif value_box:
+            ri.Value = value_box.Text
+        if param_combo and param_combo.SelectedItem:
+            ri._selected_parameter = param_combo.SelectedItem
+        if operator_combo and operator_combo.SelectedItem:
+            ri._selected_operator = operator_combo.SelectedItem
+        rule_items.append(ri)
+    return rule_items
+
+
+def _save_filter(
+    doc,
+    filter_element,
+    window,
+    all_categories,
+    rule_rows,
+    cache=None,
+    view=None,
+    graphics_model=None,
+):
+    """Save changes to the filter element and optional graphics overrides."""
+    try:
+        new_cat_ids = _collect_checked_cat_ids(window)
+        if not new_cat_ids:
+            return False
+        rule_items = _read_rule_items_from_ui(rule_rows)
         is_and = window.RadioAnd.IsChecked
         new_filter = build_element_filter(rule_items, is_and, doc, new_cat_ids)
         cat_list = List[ElementId]()
         for cid in new_cat_ids:
             cat_list.Add(cid)
-        # Single transaction for rules + graphics
-        with Transaction(doc, "Panel_Изменить настройки фильтра") as t:
+        new_name = window.FilterNameBox.Text.strip()
+        is_new = filter_element is None
+        tx_name = (
+            "Panel_Создать фильтр" if is_new else "Panel_Изменить настройки фильтра"
+        )
+        with Transaction(doc, tx_name) as t:
             t.Start()
-            new_name = window.FilterNameBox.Text.strip()
-            if new_name and new_name != filter_element.Name:
-                filter_element.Name = new_name
-            filter_element.SetCategories(cat_list)
+            if is_new:
+                filter_element = ParameterFilterElement.Create(
+                    doc, new_name or "Новый фильтр", cat_list
+                )
+                if view:
+                    view.AddFilter(filter_element.Id)
+            else:
+                if new_name and new_name != filter_element.Name:
+                    filter_element.Name = new_name
+                filter_element.SetCategories(cat_list)
             if new_filter:
                 filter_element.SetElementFilter(new_filter)
             if view and graphics_model:
@@ -1816,6 +1946,15 @@ def _save_filter(
     except Exception:
         print(traceback.format_exc())
         return False
+
+
+def _collect_checked_cat_ids(window):
+    """Collect checked category ids from UI."""
+    cat_ids = []
+    for child in _iter_category_checkboxes(window):
+        if child.IsChecked:
+            cat_ids.append(child.Tag.CategoryId)
+    return cat_ids
 
 
 def _validate_rules_vs_categories(doc, cat_ids, rule_items, cache):
@@ -1840,9 +1979,7 @@ def _validate_rules_vs_categories(doc, cat_ids, rule_items, cache):
 
 def _init_graphics_tab(window, graphics_model, doc):
     """Load GRAPHICS_TAB_XAML into the GraphicsTab and set up controls."""
-    content = XamlReader.Load(
-        XmlReader.Create(StringReader(GRAPHICS_TAB_XAML))
-    )
+    content = XamlReader.Load(XmlReader.Create(StringReader(GRAPHICS_TAB_XAML)))
     window.GraphicsContent.Child = content
     setup_graphics_tab(content, graphics_model, doc)
     return content

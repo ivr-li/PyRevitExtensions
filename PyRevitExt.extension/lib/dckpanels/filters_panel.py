@@ -454,14 +454,16 @@ class EditFilterRulesHandler(IExternalEventHandler):
         if not element:
             return
         try:
-            target_view = self.panel._determine_target_view()
-            # Only pass view if filter is applied to it
-            view_for_graphics = None
-            if element.Id in target_view.GetFilters():
-                view_for_graphics = target_view
-            saved = show_editor(self.panel.doc, element, view=view_for_graphics)
-            if saved:
-                self.panel._setup_panel()
+            check = self.panel._is_template_using()
+            if check:
+                target_view = self.panel._determine_target_view()
+                # Only pass view if filter is applied to it
+                view_for_graphics = None
+                if element.Id in target_view.GetFilters():
+                    view_for_graphics = target_view
+                saved = show_editor(self.panel.doc, element, view=view_for_graphics)
+                if saved:
+                    self.panel._setup_panel()
         except:
             print(traceback.format_exc())
 
@@ -477,26 +479,28 @@ class CreateAndEditFilterHandler(IExternalEventHandler):
 
     def Execute(self, app):
         try:
-            uidoc = app.ActiveUIDocument
-            if not uidoc:
-                return
+            check = self.panel._is_template_using()
+            if check:
+                uidoc = app.ActiveUIDocument
+                if not uidoc:
+                    return
 
-            doc = uidoc.Document
-            target_view = self.panel._determine_target_view()
-            filter_name = "Новый фильтр_{}".format(int(time.time() * 1000))
+                doc = uidoc.Document
+                target_view = self.panel._determine_target_view()
+                filter_name = "Новый фильтр_{}".format(int(time.time() * 1000))
 
-            cats = List[ElementId]()
-            with Transaction(doc, "Panel_Создать фильтр") as t:
-                t.Start()
-                f = ParameterFilterElement.Create(doc, filter_name, cats)
-                f_id = f.Id
-                # Add to view so graphics tab is available
-                target_view.AddFilter(f_id)
-                t.Commit()
+                cats = List[ElementId]()
+                with Transaction(doc, "Panel_Создать фильтр") as t:
+                    t.Start()
+                    f = ParameterFilterElement.Create(doc, filter_name, cats)
+                    f_id = f.Id
+                    # Add to view so graphics tab is available
+                    target_view.AddFilter(f_id)
+                    t.Commit()
 
-            new_filter = doc.GetElement(f_id)
-            self.panel.edit_rules_handler.filter_element = new_filter
-            self.panel.edit_rules_event.Raise()
+                new_filter = doc.GetElement(f_id)
+                self.panel.edit_rules_handler.filter_element = new_filter
+                self.panel.edit_rules_event.Raise()
 
         except Exception as ex:
             print(traceback.format_exc())
